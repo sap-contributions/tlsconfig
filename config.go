@@ -147,11 +147,24 @@ func WithIdentity(cert tls.Certificate) TLSOption {
 // presented to its peer upon connection from provided cert and key files.
 func WithIdentityFromFile(certPath string, keyPath string) TLSOption {
 	return func(c *tls.Config) error {
-		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+		watcher, err := newCertWatcher(certPath, keyPath)
 		if err != nil {
-			return fmt.Errorf("failed to load keypair: %s", err.Error())
+			return err
 		}
-		return WithIdentity(cert)(c)
+
+		if err := WithIdentity(*watcher.certificate())(c); err != nil {
+			return err
+		}
+
+		c.GetCertificate = func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			return watcher.certificate(), nil
+		}
+
+		c.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			return watcher.certificate(), nil
+		}
+
+		return nil
 	}
 }
 
@@ -182,11 +195,36 @@ func WithClientAuthenticationBuilder(builder PoolBuilder) ServerOption {
 // identity that can be validated by the CA file provided.
 func WithClientAuthenticationFromFile(caPath string) ServerOption {
 	return func(c *tls.Config) error {
-		return WithClientAuthenticationBuilder(
-			FromEmptyPool(
-				WithCertsFromFile(caPath),
-			),
-		)(c)
+		watcher, err := newCAWatcher(caPath)
+		if err != nil {
+			return err
+		}
+
+		if err := WithClientAuthentication(watcher.certPool())(c); err != nil {
+			return err
+		}
+
+		c.ClientAuth = tls.RequireAndVerifyClientCert
+		c.VerifyConnection = func(cs tls.ConnectionState) error {
+			if len(cs.PeerCertificates) == 0 {
+				return fmt.Errorf("tls: no client certificate provided")
+			}
+
+			opts := x509.VerifyOptions{
+				Roots:         watcher.certPool(),
+				Intermediates: x509.NewCertPool(),
+				KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+			}
+
+			for _, cert := range cs.PeerCertificates[1:] {
+				opts.Intermediates.AddCert(cert)
+			}
+
+			_, err := cs.PeerCertificates[0].Verify(opts)
+			return err
+		}
+
+		return nil
 	}
 }
 
@@ -216,11 +254,37 @@ func WithAuthority(authority *x509.CertPool) ClientOption {
 // that can be validated by the CA file provided.
 func WithAuthorityFromFile(caPath string) ClientOption {
 	return func(c *tls.Config) error {
-		return WithAuthorityBuilder(
-			FromEmptyPool(
-				WithCertsFromFile(caPath),
-			),
-		)(c)
+		watcher, err := newCAWatcher(caPath)
+		if err != nil {
+			return err
+		}
+
+		pool := watcher.certPool()
+		if err := WithAuthority(pool)(c); err != nil {
+			return err
+		}
+
+		c.VerifyConnection = func(cs tls.ConnectionState) error {
+			if len(cs.PeerCertificates) == 0 {
+				return fmt.Errorf("tls: no server certificate provided")
+			}
+
+			opts := x509.VerifyOptions{
+				Roots:         watcher.certPool(),
+				Intermediates: x509.NewCertPool(),
+				DNSName:       cs.ServerName,
+				KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+			}
+
+			for _, cert := range cs.PeerCertificates[1:] {
+				opts.Intermediates.AddCert(cert)
+			}
+
+			_, err := cs.PeerCertificates[0].Verify(opts)
+			return err
+		}
+
+		return nil
 	}
 }
 

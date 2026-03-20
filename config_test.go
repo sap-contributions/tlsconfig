@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -144,6 +145,85 @@ func TestE2EFromFile(t *testing.T) {
 	if len(clientConf.Certificates) == 0 {
 		t.Error("failed, expected client to negotiate certificate")
 	}
+}
+
+func TestE2EFromFileHotReload(t *testing.T) {
+	t.Parallel()
+
+	tempDir, err := os.MkdirTemp("", "")
+	if err != nil {
+		t.Fatalf("failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	caOne, err := certtest.BuildCA("tlsconfig-ca-1")
+	if err != nil {
+		t.Fatalf("failed to build first CA: %v", err)
+	}
+
+	caTwo, err := certtest.BuildCA("tlsconfig-ca-2")
+	if err != nil {
+		t.Fatalf("failed to build second CA: %v", err)
+	}
+
+	caFile, err := writeCAToTempFile(tempDir, caOne)
+	if err != nil {
+		t.Fatalf("failed to write CA file: %v", err)
+	}
+
+	serverCertFile, serverKeyFile, err := generateKeypairToTempFilesFromCA(tempDir, caOne, false)
+	if err != nil {
+		t.Fatalf("failed to generate server keypair: %v", err)
+	}
+
+	clientCertFile, clientKeyFile, err := generateKeypairToTempFilesFromCA(tempDir, caOne, false)
+	if err != nil {
+		t.Fatalf("failed to generate client keypair: %v", err)
+	}
+
+	serverConf, err := tlsconfig.Build(
+		tlsconfig.WithIdentityFromFile(serverCertFile, serverKeyFile),
+	).Server(
+		tlsconfig.WithClientAuthenticationFromFile(caFile),
+	)
+	if err != nil {
+		t.Fatalf("failed to build server config: %v", err)
+	}
+
+	clientConf, err := tlsconfig.Build(
+		tlsconfig.WithIdentityFromFile(clientCertFile, clientKeyFile),
+	).Client(
+		tlsconfig.WithAuthorityFromFile(caFile),
+	)
+	if err != nil {
+		t.Fatalf("failed to build client config: %v", err)
+	}
+
+	testClientServerTLSConnection(t, clientConf, serverConf)
+
+	rotatedServerCert, err := caTwo.BuildSignedCertificate("server")
+	if err != nil {
+		t.Fatalf("failed to make rotated server certificate: %v", err)
+	}
+
+	rotatedClientCert, err := caTwo.BuildSignedCertificate("client")
+	if err != nil {
+		t.Fatalf("failed to make rotated client certificate: %v", err)
+	}
+
+	if err := writeCertAndKeyToPaths(serverCertFile, serverKeyFile, rotatedServerCert); err != nil {
+		t.Fatalf("failed to rotate server certificate files: %v", err)
+	}
+
+	if err := writeCertAndKeyToPaths(clientCertFile, clientKeyFile, rotatedClientCert); err != nil {
+		t.Fatalf("failed to rotate client certificate files: %v", err)
+	}
+
+	if err := writeCAToPath(caFile, caTwo); err != nil {
+		t.Fatalf("failed to rotate CA file: %v", err)
+	}
+
+	waitForTLSConnectionSuccess(t, clientConf, serverConf)
 }
 
 func TestServerName(t *testing.T) {
@@ -554,6 +634,98 @@ func writeCAToTempFile(tempDir string, ca *certtest.Authority) (string, error) {
 	}
 
 	return caFile.Name(), nil
+}
+
+func writeCAToPath(path string, ca *certtest.Authority) error {
+	caBytes, err := ca.CertificatePEM()
+	if err != nil {
+		return fmt.Errorf("failed to get CA PEM encoding: %s", err)
+	}
+
+	if err := atomicWriteFile(path, caBytes); err != nil {
+		return fmt.Errorf("failed to write CA file: %s", err)
+	}
+
+	return nil
+}
+
+func writeCertAndKeyToPaths(certPath, keyPath string, cert *certtest.Certificate) error {
+	certBytes, keyBytes, err := cert.CertificatePEMAndPrivateKey()
+	if err != nil {
+		return fmt.Errorf("failed to get cert and key bytes: %s", err)
+	}
+
+	if err := atomicWriteFile(certPath, certBytes); err != nil {
+		return fmt.Errorf("failed to write cert file: %s", err)
+	}
+
+	if err := atomicWriteFile(keyPath, keyBytes); err != nil {
+		return fmt.Errorf("failed to write key file: %s", err)
+	}
+
+	return nil
+}
+
+func atomicWriteFile(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+
+	return nil
+}
+
+func waitForTLSConnectionSuccess(t *testing.T, clientConf, serverConf *tls.Config) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	var lastErr error
+
+	for time.Now().Before(deadline) {
+		s := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, "hello, world!")
+		}))
+		s.TLS = serverConf
+		s.StartTLS()
+
+		transport := &http.Transport{TLSClientConfig: clientConf}
+		client := &http.Client{Transport: transport}
+
+		res, err := client.Get(s.URL)
+		if err == nil {
+			_, _ = io.ReadAll(res.Body)
+			res.Body.Close()
+			transport.CloseIdleConnections()
+			s.Close()
+			return
+		}
+
+		lastErr = err
+		transport.CloseIdleConnections()
+		s.Close()
+
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	t.Fatalf("timed out waiting for TLS connection to succeed after rotation: %v", lastErr)
 }
 
 func generateKeypairToTempFilesFromCA(tempDir string, ca *certtest.Authority, expired bool) (string, string, error) {
