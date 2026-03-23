@@ -5,7 +5,6 @@ import (
 	"crypto/x509"
 	"fmt"
 	"path/filepath"
-	"sync"
 	"sync/atomic"
 
 	"github.com/fsnotify/fsnotify"
@@ -16,7 +15,6 @@ type certWatcher struct {
 	keyPath  string
 
 	snapshot atomic.Value // *tls.Certificate
-	reloadMu sync.Mutex
 }
 
 func newCertWatcher(certPath, keyPath string) (*certWatcher, error) {
@@ -44,9 +42,6 @@ func (r *certWatcher) certificate() *tls.Certificate {
 }
 
 func (r *certWatcher) reload() {
-	r.reloadMu.Lock()
-	defer r.reloadMu.Unlock()
-
 	certificate, err := r.loadCertificate()
 	if err != nil {
 		return
@@ -81,7 +76,6 @@ type caWatcher struct {
 	caPath string
 
 	snapshot atomic.Value // *x509.CertPool
-	reloadMu sync.Mutex
 }
 
 func newCAWatcher(caPath string) (*caWatcher, error) {
@@ -106,9 +100,6 @@ func (r *caWatcher) certPool() *x509.CertPool {
 }
 
 func (r *caWatcher) reload() {
-	r.reloadMu.Lock()
-	defer r.reloadMu.Unlock()
-
 	pool, err := r.loadPool()
 	if err != nil {
 		return
@@ -175,7 +166,7 @@ func handleWatchEvent(watcher *fsnotify.Watcher, event fsnotify.Event, onChange 
 	switch {
 	case event.Op.Has(fsnotify.Write):
 	case event.Op.Has(fsnotify.Create):
-	case event.Op.Has(fsnotify.Chmod), event.Op.Has(fsnotify.Remove), event.Op.Has(fsnotify.Rename):
+	case event.Op.Has(fsnotify.Chmod), event.Op.Has(fsnotify.Remove), event.Op.Has(fsnotify.Rename): // Kubernetes secrets are replaced by renaming the file, so we need to watch for rename and remove events.
 		_ = watcher.Add(event.Name)
 	default:
 		return

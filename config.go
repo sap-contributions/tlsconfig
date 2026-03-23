@@ -152,10 +152,6 @@ func WithIdentityFromFile(certPath string, keyPath string) TLSOption {
 			return err
 		}
 
-		if err := WithIdentity(*watcher.certificate())(c); err != nil {
-			return err
-		}
-
 		c.GetCertificate = func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 			return watcher.certificate(), nil
 		}
@@ -204,7 +200,6 @@ func WithClientAuthenticationFromFile(caPath string) ServerOption {
 			return err
 		}
 
-		c.ClientAuth = tls.RequireAndVerifyClientCert
 		c.VerifyConnection = func(cs tls.ConnectionState) error {
 			if len(cs.PeerCertificates) == 0 {
 				return fmt.Errorf("tls: no client certificate provided")
